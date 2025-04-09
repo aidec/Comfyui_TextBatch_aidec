@@ -80,7 +80,7 @@ class TextBatchNode:
     CATEGORY = "TextBatch"
     OUTPUT_NODE = True  # 添加這行
 
-    def process_text(self, input_mode, text_file, input_text, separator_type, separator, start_index, auto_stop):
+    def process_text(self, input_mode, text_file, input_text, separator_type, separator, start_index, auto_stop, unique_id=None):
         """
         處理文本文件或直接輸入文本的主要方法
         參數:
@@ -91,6 +91,7 @@ class TextBatchNode:
             separator: 用於分割文本的分隔符
             start_index: 開始處理的索引位置
             auto_stop: 是否自動終止
+            unique_id: 節點的唯一識別碼，用於更新節點顯示
         返回:
             tuple: (提示文本, 狀態信息, 當前索引, 總數, 是否完成)
         """
