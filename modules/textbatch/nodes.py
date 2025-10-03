@@ -749,8 +749,8 @@ class LoadImagesFromDirBatchM:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK", "INT", "STRING", "STRING")
-    RETURN_NAMES = ("image", "mask", "count", "filenames", "full_paths")
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "count", "filenames", "full_paths", "path_only")
     FUNCTION = "load_images"
 
     CATEGORY = "image"
@@ -783,7 +783,7 @@ class LoadImagesFromDirBatchM:
         masks = []
         filenames = []  # 檔名列表（不含路徑）
         full_paths = []  # 完整路徑列表
-
+        path_only = directory  # =輸入路徑
         limit_images = False
         if image_load_cap > 0:
             limit_images = True
@@ -818,7 +818,7 @@ class LoadImagesFromDirBatchM:
 
         if len(images) == 1:
             # 單張圖片時返回單一檔名和路徑
-            return (images[0], masks[0], 1, filenames[0], full_paths[0])
+            return (images[0], masks[0], 1, filenames[0], full_paths[0], path_only)
 
         elif len(images) > 1:
             image1 = images[0]
@@ -845,7 +845,7 @@ class LoadImagesFromDirBatchM:
                     mask1 = torch.cat((mask1, mask2), dim=0)
 
             # 多張圖片時返回以逗號分隔的檔名和路徑字串
-            return (image1, mask1, len(images), ",".join(filenames), ",".join(full_paths))
+            return (image1, mask1, len(images), ",".join(filenames), ",".join(full_paths), path_only)
 
 class ImageFilenameProcessor:
     """圖片檔名處理節點
