@@ -888,7 +888,7 @@ class ImageFilenameProcessor:
                 return ("", "", "", "", 0, "錯誤：沒有輸入檔名")
 
             # 分割檔名列表
-            if '\n' in filenames
+            if '\n' in filenames:
                 path_list = [f.strip() for f in filenames.split("\n") if f.strip()]
             else
                 path_list = [f.strip() for f in filenames.split(",") if f.strip()]
