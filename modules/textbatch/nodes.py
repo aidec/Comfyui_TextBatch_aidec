@@ -945,6 +945,457 @@ class ImageFilenameProcessor:
             logger.error(f"處理檔名時發生錯誤: {str(e)}")
             return ("", "", "", "", 0, f"錯誤: {str(e)}")
 
+class ImageQueueProcessorPlus:
+    """處理圖片佇列的增強節點
+    支持兩個圖片輸入，可以將新圖片合併到佇列中實現循環處理
+    支持自動停止條件（最大索引或開關控制）
+    """
+    def __init__(self):
+        self.state_file = os.path.join(os.path.dirname(__file__), "image_queue_processor_plus_state.json")
+        self.state = self.load_state()
+        self.image_queue = []
+
+    def reset_state(self):
+        self.state = {
+            "current_index": 0,
+            "last_input": "",
+            "completed": False,
+            "queue_count": 0
+        }
+        self.image_queue = []
+        self.save_state()
+
+    def load_state(self):
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading state file: {str(e)}")
+        return {
+            "current_index": 0,
+            "last_input": "",
+            "completed": False,
+            "queue_count": 0
+        }
+
+    def save_state(self):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.state, f)
+        except Exception as e:
+            logger.error(f"Error saving state file: {str(e)}")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),  # 初始圖片
+                "start_index": ("INT", {"default": 0, "min": 0, "max": 10000}),
+                "max_index": ("INT", {"default": 10, "min": 1, "max": 10000}),  # 最大執行索引
+                "trigger_next": ("BOOLEAN", {"default": True, "label_on": "Trigger", "label_off": "Don't trigger"}),
+                "enable_loop": ("BOOLEAN", {"default": True, "label_on": "Enabled", "label_off": "Disabled"}),  # 循環開關
+            },
+            "optional": {
+                "additional_image": ("IMAGE",),  # 額外的圖片輸入
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "BOOLEAN", "STRING")
+    RETURN_NAMES = ("image", "current_index", "total", "completed", "status")
+    FUNCTION = "process"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def process(self, images, start_index, max_index, trigger_next, enable_loop, unique_id, 
+                additional_image=None, prompt=None, extra_pnginfo=None):
+        try:
+            # 確保輸入是 tensor 並且格式正確
+            if not isinstance(images, torch.Tensor):
+                return (None, -1, 0, True, "Invalid input: not a tensor")
+
+            # 處理單張圖片的情況
+            if len(images.shape) == 3:
+                images = images.unsqueeze(0)
+
+            # 生成唯一的輸入標識符
+            input_hash = str(hash(str(images.shape)))
+
+            # 檢查是否需要重置
+            need_reset = (
+                self.state.get("last_input") != input_hash or
+                self.state.get("completed", False) or
+                (prompt and extra_pnginfo)
+            )
+
+            if need_reset:
+                self.reset_state()
+                self.state["last_input"] = input_hash
+                self.image_queue = [images[i:i+1] for i in range(images.shape[0])]
+                current_index = start_index
+            else:
+                current_index = min(max(start_index, self.state.get("current_index", 0)), len(self.image_queue) - 1)
+
+            # 如果有額外圖片輸入，將其添加到佇列
+            if additional_image is not None:
+                if isinstance(additional_image, torch.Tensor):
+                    if len(additional_image.shape) == 3:
+                        additional_image = additional_image.unsqueeze(0)
+                    # 將額外圖片添加到佇列
+                    for i in range(additional_image.shape[0]):
+                        self.image_queue.append(additional_image[i:i+1])
+                    logger.info(f"Added {additional_image.shape[0]} images to queue")
+
+            total = len(self.image_queue)
+            if total == 0:
+                return (None, -1, 0, True, "No images in queue")
+
+            # 確保索引有效
+            if current_index >= total:
+                current_index = total - 1
+
+            # 獲取當前圖片
+            current_image = self.image_queue[current_index]
+
+            # 檢查是否應該停止
+            # 條件1: 達到最大索引
+            # 條件2: 循環開關被關閉
+            # 條件3: 已經是最後一張
+            should_stop = (
+                current_index >= max_index - 1 or
+                not enable_loop or
+                current_index >= total - 1
+            )
+            
+            # 更新狀態
+            if not should_stop and trigger_next:
+                next_index = current_index + 1
+                self.state["current_index"] = next_index
+                completed = False
+                
+                # 發送佇列事件
+                PromptServer.instance.send_sync("textbatch-add-queue", {})
+            else:
+                completed = True
+                self.state["current_index"] = 0
+                self.state["completed"] = True
+
+            self.state["completed"] = completed
+            self.state["queue_count"] = total
+            self.save_state()
+
+            # 生成狀態信息
+            status = f"Processing {current_index + 1}/{total}"
+            if current_index >= max_index - 1:
+                status += " | Reached max_index"
+            if not enable_loop:
+                status += " | Loop disabled"
+            if completed:
+                status += " | Completed"
+
+            # 更新節點顯示的當前索引
+            if not completed:
+                PromptServer.instance.send_sync("textbatch-node-feedback", 
+                    {"node_id": unique_id, "widget_name": "start_index", "type": "int", "value": self.state["current_index"]})
+
+            return (current_image, current_index, total, completed, status)
+
+        except Exception as e:
+            logger.error(f"Error in ImageQueueProcessorPlus: {str(e)}")
+            return (None, -1, 0, True, f"Error: {str(e)}")
+
+class TextSplitGet:
+    """文本分割並獲取指定索引的節點
+    支持多種分隔符和註解過濾
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {
+                    "multiline": True,
+                    "default": "item1\nitem2\nitem3\n# comment",
+                    "placeholder": "輸入文本"
+                }),
+                "index": ("INT", {"default": 0, "min": 0, "max": 10000}),
+                "separator_type": (["newline", "comma", "semicolon", "custom"], {"default": "newline"}),
+                "custom_separator": ("STRING", {"default": "|"}),
+                "ignore_comment": ("BOOLEAN", {"default": True}),
+                "comment_prefix": ("STRING", {"default": "#"}),
+                "trim_whitespace": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
+    RETURN_NAMES = ("text", "current_index", "total", "status")
+    FUNCTION = "process"
+    CATEGORY = "TextBatch"
+
+    def process(self, text, index, separator_type, custom_separator, ignore_comment, comment_prefix, trim_whitespace):
+        try:
+            if not text.strip():
+                return ("", 0, 0, "Error: Empty text input")
+
+            # 根據分隔符類型選擇分隔符
+            separator_map = {
+                "newline": "\n",
+                "comma": ",",
+                "semicolon": ";",
+                "custom": custom_separator
+            }
+            separator = separator_map.get(separator_type, "\n")
+
+            # 分割文本
+            if separator_type == "newline":
+                parts = text.splitlines()
+            else:
+                parts = text.split(separator)
+
+            # 處理每個部分
+            processed_parts = []
+            for part in parts:
+                # 去除空白
+                if trim_whitespace:
+                    part = part.strip()
+                
+                # 跳過空行
+                if not part:
+                    continue
+                
+                # 過濾註解
+                if ignore_comment and comment_prefix and part.startswith(comment_prefix):
+                    continue
+                
+                processed_parts.append(part)
+
+            total = len(processed_parts)
+            
+            if total == 0:
+                return ("", 0, 0, "No valid text found after filtering")
+
+            # 確保索引在有效範圍內
+            index = max(0, min(index, total - 1))
+            
+            # 獲取指定索引的文本
+            result_text = processed_parts[index]
+            
+            status = f"Retrieved item {index + 1}/{total}"
+            
+            return (result_text, index, total, status)
+
+        except Exception as e:
+            logger.error(f"Error in TextSplitGet: {str(e)}")
+            return ("", 0, 0, f"Error: {str(e)}")
+
+class IFMatchCond:
+    """數學條件判斷節點
+    根據數學條件返回 true 或 false
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "value_a": ("FLOAT", {"default": 0.0, "min": -999999.0, "max": 999999.0, "step": 0.01}),
+                "operator": (["==", "!=", ">", ">=", "<", "<="], {"default": "=="}),
+                "value_b": ("FLOAT", {"default": 0.0, "min": -999999.0, "max": 999999.0, "step": 0.01}),
+            },
+            "optional": {
+                "int_a": ("INT", {"default": 0, "min": -999999, "max": 999999}),
+                "int_b": ("INT", {"default": 0, "min": -999999, "max": 999999}),
+                "use_int": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("BOOLEAN", "STRING")
+    RETURN_NAMES = ("result", "status")
+    FUNCTION = "evaluate"
+    CATEGORY = "TextBatch"
+
+    def evaluate(self, value_a, operator, value_b, int_a=0, int_b=0, use_int=False):
+        try:
+            # 選擇使用整數或浮點數
+            if use_int:
+                a = int_a
+                b = int_b
+            else:
+                a = value_a
+                b = value_b
+
+            # 執行比較
+            result = False
+            if operator == "==":
+                result = a == b
+            elif operator == "!=":
+                result = a != b
+            elif operator == ">":
+                result = a > b
+            elif operator == ">=":
+                result = a >= b
+            elif operator == "<":
+                result = a < b
+            elif operator == "<=":
+                result = a <= b
+
+            status = f"{a} {operator} {b} = {result}"
+            
+            return (result, status)
+
+        except Exception as e:
+            logger.error(f"Error in IFMatchCond: {str(e)}")
+            return (False, f"Error: {str(e)}")
+
+# 全局資料暫存器
+_DATA_TEMP_STORAGE = {}
+
+class DataTmpSet:
+    """資料暫存器設置節點
+    可以存儲文本、圖片或任意資料類型
+    支持變數和陣列模式
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "var_name": ("STRING", {"default": "my_var", "multiline": False}),
+                "storage_mode": (["variable", "array"], {"default": "variable"}),
+                "data_type": (["text", "image", "any"], {"default": "text"}),
+            },
+            "optional": {
+                "text_data": ("STRING", {"default": "", "multiline": True}),
+                "image_data": ("IMAGE",),
+                "any_data": ("*",),
+                "array_index": ("INT", {"default": -1, "min": -1, "max": 10000}),  # -1 表示添加到末尾
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "set_data"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def set_data(self, var_name, storage_mode, data_type, text_data="", image_data=None, any_data=None, array_index=-1):
+        try:
+            global _DATA_TEMP_STORAGE
+
+            # 根據資料類型選擇資料
+            if data_type == "text":
+                data = text_data
+            elif data_type == "image":
+                data = image_data
+            elif data_type == "any":
+                data = any_data
+            else:
+                return (f"Error: Unknown data type {data_type}",)
+
+            # 根據存儲模式處理
+            if storage_mode == "variable":
+                _DATA_TEMP_STORAGE[var_name] = data
+                status = f"Stored data in variable '{var_name}'"
+            
+            elif storage_mode == "array":
+                # 初始化陣列（如果不存在）
+                if var_name not in _DATA_TEMP_STORAGE or not isinstance(_DATA_TEMP_STORAGE[var_name], list):
+                    _DATA_TEMP_STORAGE[var_name] = []
+                
+                # 添加或設置資料
+                if array_index == -1:
+                    # 添加到末尾
+                    _DATA_TEMP_STORAGE[var_name].append(data)
+                    status = f"Appended data to array '{var_name}' (index {len(_DATA_TEMP_STORAGE[var_name]) - 1})"
+                else:
+                    # 設置指定索引
+                    # 如果索引超出範圍，擴展陣列
+                    while len(_DATA_TEMP_STORAGE[var_name]) <= array_index:
+                        _DATA_TEMP_STORAGE[var_name].append(None)
+                    _DATA_TEMP_STORAGE[var_name][array_index] = data
+                    status = f"Set data in array '{var_name}' at index {array_index}"
+
+            logger.info(f"DataTmpSet: {status}")
+            return (status,)
+
+        except Exception as e:
+            logger.error(f"Error in DataTmpSet: {str(e)}")
+            return (f"Error: {str(e)}",)
+
+class DataTmpGet:
+    """資料暫存器讀取節點
+    讀取暫存器中的資料
+    支持變數和陣列索引
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "var_name": ("STRING", {"default": "my_var", "multiline": False}),
+                "data_type": (["text", "image", "any"], {"default": "text"}),
+            },
+            "optional": {
+                "array_index": ("INT", {"default": -1, "min": -1, "max": 10000}),  # -1 表示不使用索引
+                "default_text": ("STRING", {"default": "", "multiline": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "*", "STRING")
+    RETURN_NAMES = ("text", "image", "any", "status")
+    FUNCTION = "get_data"
+    CATEGORY = "TextBatch"
+
+    def get_data(self, var_name, data_type, array_index=-1, default_text=""):
+        try:
+            global _DATA_TEMP_STORAGE
+
+            # 檢查變數是否存在
+            if var_name not in _DATA_TEMP_STORAGE:
+                status = f"Variable '{var_name}' not found, using default"
+                return (default_text, None, None, status)
+
+            data = _DATA_TEMP_STORAGE[var_name]
+
+            # 如果是陣列模式
+            if array_index >= 0:
+                if not isinstance(data, list):
+                    status = f"Error: '{var_name}' is not an array"
+                    return (default_text, None, None, status)
+                
+                if array_index >= len(data):
+                    status = f"Error: Index {array_index} out of range (array size: {len(data)})"
+                    return (default_text, None, None, status)
+                
+                data = data[array_index]
+                status = f"Retrieved data from array '{var_name}' at index {array_index}"
+            else:
+                status = f"Retrieved data from variable '{var_name}'"
+
+            # 根據資料類型返回
+            if data_type == "text":
+                if isinstance(data, str):
+                    return (data, None, None, status)
+                else:
+                    return (str(data), None, None, status)
+            elif data_type == "image":
+                if isinstance(data, torch.Tensor):
+                    return ("", data, None, status)
+                else:
+                    return ("", None, None, f"Error: Data is not an image tensor")
+            elif data_type == "any":
+                return ("", None, data, status)
+
+            return (default_text, None, None, "Error: Unknown data type")
+
+        except Exception as e:
+            logger.error(f"Error in DataTmpGet: {str(e)}")
+            return (default_text, None, None, f"Error: {str(e)}")
+
 # 節點類映射
 NODE_CLASS_MAPPINGS = {
     "TextBatch": TextBatchNode, 
@@ -954,7 +1405,12 @@ NODE_CLASS_MAPPINGS = {
     "ImageInfoExtractor": ImageInfoExtractorNode,
     "PathParser": PathParserNode,
     "LoadImagesFromDirBatch": LoadImagesFromDirBatchM,
-    "ImageFilenameProcessor": ImageFilenameProcessor  # 添加新節點
+    "ImageFilenameProcessor": ImageFilenameProcessor,
+    "ImageQueueProcessorPlus": ImageQueueProcessorPlus,  # 新增
+    "TextSplitGet": TextSplitGet,  # 新增
+    "IFMatchCond": IFMatchCond,  # 新增
+    "DataTmpSet": DataTmpSet,  # 新增
+    "DataTmpGet": DataTmpGet  # 新增
 }
 
 # 節點顯示名稱映射
@@ -966,5 +1422,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImageInfoExtractor": "Image Info Extractor",
     "PathParser": "Path Parser",
     "LoadImagesFromDirBatch": "Load Images From Dir Batch",
-    "ImageFilenameProcessor": "Image Filename Processor"  # 添加新節點
+    "ImageFilenameProcessor": "Image Filename Processor",
+    "ImageQueueProcessorPlus": "Image Queue Processor Plus",  # 新增
+    "TextSplitGet": "Text Split Get",  # 新增
+    "IFMatchCond": "IF Match Condition",  # 新增
+    "DataTmpSet": "Data Temp Set",  # 新增
+    "DataTmpGet": "Data Temp Get"  # 新增
 }
