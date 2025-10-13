@@ -953,16 +953,19 @@ class ImageQueueProcessorPlus:
     def __init__(self):
         self.state_file = os.path.join(os.path.dirname(__file__), "image_queue_processor_plus_state.json")
         self.state = self.load_state()
-        self.image_queue = []
 
-    def reset_state(self):
+    def reset_state(self, queue_id="default"):
+        """重置狀態到初始值"""
+        global _IMAGE_QUEUE_STORAGE
         self.state = {
             "current_index": 0,
             "last_input": "",
             "completed": False,
             "queue_count": 0
         }
-        self.image_queue = []
+        # 清空全局佇列
+        if queue_id in _IMAGE_QUEUE_STORAGE:
+            del _IMAGE_QUEUE_STORAGE[queue_id]
         self.save_state()
 
     def load_state(self):
@@ -998,6 +1001,8 @@ class ImageQueueProcessorPlus:
             },
             "optional": {
                 "additional_image": ("IMAGE",),  # 額外的圖片輸入
+                "data_tmp_var": ("STRING", {"default": "", "multiline": False}),  # 從 DataTmpSet 讀取的變數名稱
+                "use_data_tmp": ("BOOLEAN", {"default": False}),  # 是否使用 DataTmpSet 的資料
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1013,11 +1018,18 @@ class ImageQueueProcessorPlus:
     OUTPUT_NODE = True
 
     def process(self, images, start_index, max_index, trigger_next, enable_loop, unique_id, 
-                additional_image=None, prompt=None, extra_pnginfo=None):
+                additional_image=None, data_tmp_var="", use_data_tmp=False, prompt=None, extra_pnginfo=None):
         try:
+            global _IMAGE_QUEUE_STORAGE, _DATA_TEMP_STORAGE
+            
+            # 使用 unique_id 作為佇列標識
+            queue_id = unique_id if unique_id else "default"
+            
             # 確保輸入是 tensor 並且格式正確
             if not isinstance(images, torch.Tensor):
-                return (None, -1, 0, True, "Invalid input: not a tensor")
+                # 創建一個空白圖片作為錯誤返回
+                error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                return (error_image, -1, 0, True, "Invalid input: not a tensor")
 
             # 處理單張圖片的情況
             if len(images.shape) == 3:
@@ -1026,7 +1038,7 @@ class ImageQueueProcessorPlus:
             # 生成唯一的輸入標識符
             input_hash = str(hash(str(images.shape)))
 
-            # 檢查是否需要重置
+            # 檢查是否需要重置（images 輸入變化時重置）
             need_reset = (
                 self.state.get("last_input") != input_hash or
                 self.state.get("completed", False) or
@@ -1034,49 +1046,137 @@ class ImageQueueProcessorPlus:
             )
 
             if need_reset:
-                self.reset_state()
+                self.reset_state(queue_id)
                 self.state["last_input"] = input_hash
-                self.image_queue = [images[i:i+1] for i in range(images.shape[0])]
+                self.state["last_data_tmp_size"] = 0
+                # 初始化全局佇列（只用 images）
+                _IMAGE_QUEUE_STORAGE[queue_id] = [images[i:i+1] for i in range(images.shape[0])]
                 current_index = start_index
+                logger.info(f"Reset queue for {queue_id}, initialized with {images.shape[0]} images")
             else:
-                current_index = min(max(start_index, self.state.get("current_index", 0)), len(self.image_queue) - 1)
+                # 使用全局佇列
+                if queue_id not in _IMAGE_QUEUE_STORAGE:
+                    _IMAGE_QUEUE_STORAGE[queue_id] = [images[i:i+1] for i in range(images.shape[0])]
+                current_index = self.state.get("current_index", start_index)
+
+            # ========== 在處理前先檢查並載入 data_tmp_var 的新內容 ==========
+            # 檢查 data_tmp_var 的當前大小
+            data_tmp_size = 0
+            if use_data_tmp and data_tmp_var and data_tmp_var.strip():
+                if data_tmp_var in _DATA_TEMP_STORAGE:
+                    tmp_data = _DATA_TEMP_STORAGE[data_tmp_var]
+                    if isinstance(tmp_data, list):
+                        data_tmp_size = len(tmp_data)
+                    elif isinstance(tmp_data, torch.Tensor):
+                        data_tmp_size = tmp_data.shape[0] if len(tmp_data.shape) >= 1 else 1
+
+            # 記錄上次的 data_tmp_size
+            last_data_tmp_size = self.state.get("last_data_tmp_size", 0)
+            data_tmp_changed = (data_tmp_size != last_data_tmp_size)
+
+            # 如果 data_tmp_var 變化了，重新載入
+            if use_data_tmp and data_tmp_var and data_tmp_var.strip() and data_tmp_var in _DATA_TEMP_STORAGE:
+                if data_tmp_changed or need_reset:
+                    # 重置佇列到初始 images（清除舊的 data_tmp 圖片）
+                    if data_tmp_changed and not need_reset:
+                        _IMAGE_QUEUE_STORAGE[queue_id] = [images[i:i+1] for i in range(images.shape[0])]
+                        # 重置索引到 0，因為佇列已經重建
+                        current_index = 0
+                        self.state["current_index"] = 0
+                        logger.info(f"Data tmp var changed ({last_data_tmp_size} -> {data_tmp_size}), reset queue and index")
+                    
+                    tmp_data = _DATA_TEMP_STORAGE[data_tmp_var]
+                    added_count = 0
+                    
+                    # 處理陣列
+                    if isinstance(tmp_data, list):
+                        for item in tmp_data:
+                            if isinstance(item, torch.Tensor):
+                                if len(item.shape) == 3:
+                                    item = item.unsqueeze(0)
+                                for i in range(item.shape[0]):
+                                    _IMAGE_QUEUE_STORAGE[queue_id].append(item[i:i+1])
+                                    added_count += 1
+                    # 處理單一圖片
+                    elif isinstance(tmp_data, torch.Tensor):
+                        if len(tmp_data.shape) == 3:
+                            tmp_data = tmp_data.unsqueeze(0)
+                        for i in range(tmp_data.shape[0]):
+                            _IMAGE_QUEUE_STORAGE[queue_id].append(tmp_data[i:i+1])
+                            added_count += 1
+                    
+                    if added_count > 0:
+                        logger.info(f"Added {added_count} images from DataTmpSet['{data_tmp_var}'] to queue")
+                    
+                    # 更新記錄的 data_tmp_size
+                    self.state["last_data_tmp_size"] = data_tmp_size
 
             # 如果有額外圖片輸入，將其添加到佇列
             if additional_image is not None:
                 if isinstance(additional_image, torch.Tensor):
                     if len(additional_image.shape) == 3:
                         additional_image = additional_image.unsqueeze(0)
-                    # 將額外圖片添加到佇列
+                    # 將額外圖片添加到全局佇列
                     for i in range(additional_image.shape[0]):
-                        self.image_queue.append(additional_image[i:i+1])
-                    logger.info(f"Added {additional_image.shape[0]} images to queue")
+                        _IMAGE_QUEUE_STORAGE[queue_id].append(additional_image[i:i+1])
+                    logger.info(f"Added {additional_image.shape[0]} images from additional_image to queue")
 
-            total = len(self.image_queue)
+            total = len(_IMAGE_QUEUE_STORAGE[queue_id])
+
+            # ========== 檢查當前索引是否有效 ==========
             if total == 0:
-                return (None, -1, 0, True, "No images in queue")
+                # 創建一個空白圖片作為錯誤返回
+                error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                return (error_image, -1, 0, True, "No images in queue")
 
-            # 確保索引有效
+            # 如果當前索引超出範圍，表示已經處理完所有圖片
             if current_index >= total:
-                current_index = total - 1
+                logger.info(f"Current index {current_index} >= total {total}, completed")
+                self.state["current_index"] = 0
+                self.state["completed"] = True
+                self.save_state()
+                # 返回最後一張圖片
+                error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                return (error_image, current_index, total, True, f"Completed: index {current_index} >= total {total}")
 
             # 獲取當前圖片
-            current_image = self.image_queue[current_index]
+            current_image = _IMAGE_QUEUE_STORAGE[queue_id][current_index]
 
-            # 檢查是否應該停止
-            # 條件1: 達到最大索引
-            # 條件2: 循環開關被關閉
-            # 條件3: 已經是最後一張
-            should_stop = (
-                current_index >= max_index - 1 or
-                not enable_loop or
-                current_index >= total - 1
-            )
+            # ========== 決定是否繼續到下一輪 ==========
+            # 計算下一個索引
+            next_index = current_index + 1
+            
+            # 檢查停止條件
+            should_stop = False
+            stop_reason = []
+            
+            # 條件 1: 檢查下一個索引是否超過 max_index
+            if next_index >= max_index:
+                should_stop = True
+                stop_reason.append(f"next_index({next_index}) >= max_index({max_index})")
+            
+            # 條件 2: 檢查循環開關
+            if not enable_loop:
+                should_stop = True
+                stop_reason.append("loop_disabled")
+            
+            # 條件 3: 檢查是否還有圖片（下一個索引是否有效）
+            # 注意：這裡不能完全確定，因為下一輪可能會有新圖片加入
+            # 所以只在確定沒有 data_tmp_var 的情況下才檢查
+            if next_index >= total:
+                if not (use_data_tmp and data_tmp_var and data_tmp_var.strip()):
+                    # 沒有使用 data_tmp_var，確定沒有新圖片了
+                    should_stop = True
+                    stop_reason.append(f"next_index({next_index}) >= total({total}), no data_tmp")
+                else:
+                    # 使用了 data_tmp_var，可能會有新圖片，先繼續
+                    logger.info(f"next_index({next_index}) >= total({total}), but data_tmp enabled, will check next round")
             
             # 更新狀態
             if not should_stop and trigger_next:
-                next_index = current_index + 1
                 self.state["current_index"] = next_index
                 completed = False
+                logger.info(f"Continue to next index: {next_index}")
                 
                 # 發送佇列事件
                 PromptServer.instance.send_sync("textbatch-add-queue", {})
@@ -1084,6 +1184,8 @@ class ImageQueueProcessorPlus:
                 completed = True
                 self.state["current_index"] = 0
                 self.state["completed"] = True
+                if stop_reason:
+                    logger.info(f"Stop loop: {', '.join(stop_reason)}")
 
             self.state["completed"] = completed
             self.state["queue_count"] = total
@@ -1091,12 +1193,16 @@ class ImageQueueProcessorPlus:
 
             # 生成狀態信息
             status = f"Processing {current_index + 1}/{total}"
-            if current_index >= max_index - 1:
-                status += " | Reached max_index"
+            if next_index >= max_index:
+                status += f" | Will reach max_index({max_index})"
             if not enable_loop:
                 status += " | Loop disabled"
+            if data_tmp_changed:
+                status += f" | Data updated ({last_data_tmp_size}->{data_tmp_size})"
             if completed:
                 status += " | Completed"
+                if stop_reason:
+                    status += f" ({', '.join(stop_reason)})"
 
             # 更新節點顯示的當前索引
             if not completed:
@@ -1107,7 +1213,11 @@ class ImageQueueProcessorPlus:
 
         except Exception as e:
             logger.error(f"Error in ImageQueueProcessorPlus: {str(e)}")
-            return (None, -1, 0, True, f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 創建一個空白圖片作為錯誤返回
+            error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return (error_image, -1, 0, True, f"Error: {str(e)}")
 
 class TextSplitGet:
     """文本分割並獲取指定索引的節點
@@ -1132,15 +1242,15 @@ class TextSplitGet:
             }
         }
 
-    RETURN_TYPES = ("STRING", "INT", "INT", "STRING")
-    RETURN_NAMES = ("text", "current_index", "total", "status")
+    RETURN_TYPES = ("STRING", "INT", "INT", "*", "STRING")
+    RETURN_NAMES = ("text", "current_index", "total", "array", "status")
     FUNCTION = "process"
     CATEGORY = "TextBatch"
 
     def process(self, text, index, separator_type, custom_separator, ignore_comment, comment_prefix, trim_whitespace):
         try:
             if not text.strip():
-                return ("", 0, 0, "Error: Empty text input")
+                return ("", 0, 0, [], "Error: Empty text input")
 
             # 根據分隔符類型選擇分隔符
             separator_map = {
@@ -1177,7 +1287,7 @@ class TextSplitGet:
             total = len(processed_parts)
             
             if total == 0:
-                return ("", 0, 0, "No valid text found after filtering")
+                return ("", 0, 0, [], "No valid text found after filtering")
 
             # 確保索引在有效範圍內
             index = max(0, min(index, total - 1))
@@ -1187,11 +1297,12 @@ class TextSplitGet:
             
             status = f"Retrieved item {index + 1}/{total}"
             
-            return (result_text, index, total, status)
+            # 返回包含完整陣列
+            return (result_text, index, total, processed_parts, status)
 
         except Exception as e:
             logger.error(f"Error in TextSplitGet: {str(e)}")
-            return ("", 0, 0, f"Error: {str(e)}")
+            return ("", 0, 0, [], f"Error: {str(e)}")
 
 class IFMatchCond:
     """數學條件判斷節點
@@ -1254,10 +1365,13 @@ class IFMatchCond:
 # 全局資料暫存器
 _DATA_TEMP_STORAGE = {}
 
+# 全局圖片佇列存儲（用於 ImageQueueProcessorPlus）
+_IMAGE_QUEUE_STORAGE = {}
+
 class DataTmpSet:
     """資料暫存器設置節點
     可以存儲文本、圖片或任意資料類型
-    支持變數和陣列模式
+    支持變數和陣列模式，以及清除功能
     """
     
     @classmethod
@@ -1265,66 +1379,129 @@ class DataTmpSet:
         return {
             "required": {
                 "var_name": ("STRING", {"default": "my_var", "multiline": False}),
-                "storage_mode": (["variable", "array"], {"default": "variable"}),
+                "operation": (["set_variable", "array_push", "array_set_index", "clear_all", "clear_index"], {"default": "set_variable"}),
                 "data_type": (["text", "image", "any"], {"default": "text"}),
             },
             "optional": {
                 "text_data": ("STRING", {"default": "", "multiline": True}),
                 "image_data": ("IMAGE",),
                 "any_data": ("*",),
-                "array_index": ("INT", {"default": -1, "min": -1, "max": 10000}),  # -1 表示添加到末尾
+                "array_index": ("INT", {"default": 0, "min": 0, "max": 10000}),
             }
         }
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("status",)
+    RETURN_TYPES = ("STRING", "IMAGE", "INT", "STRING")
+    RETURN_NAMES = ("status", "preview", "array_size", "info")
     FUNCTION = "set_data"
     CATEGORY = "TextBatch"
     OUTPUT_NODE = True
 
-    def set_data(self, var_name, storage_mode, data_type, text_data="", image_data=None, any_data=None, array_index=-1):
+    def set_data(self, var_name, operation, data_type, text_data="", image_data=None, any_data=None, array_index=0):
         try:
             global _DATA_TEMP_STORAGE
+            
+            # 預設預覽圖片（空白圖）
+            default_preview = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+
+            # 清除操作
+            if operation == "clear_all":
+                if var_name in _DATA_TEMP_STORAGE:
+                    del _DATA_TEMP_STORAGE[var_name]
+                    status = f"Cleared all data in variable '{var_name}'"
+                    info = f"Variable '{var_name}' cleared"
+                else:
+                    status = f"Variable '{var_name}' does not exist, nothing to clear"
+                    info = "Nothing to clear"
+                logger.info(f"DataTmpSet: {status}")
+                return (status, default_preview, 0, info)
+            
+            elif operation == "clear_index":
+                if var_name not in _DATA_TEMP_STORAGE:
+                    status = f"Variable '{var_name}' does not exist"
+                    return (status, default_preview, 0, status)
+                elif not isinstance(_DATA_TEMP_STORAGE[var_name], list):
+                    status = f"Variable '{var_name}' is not an array"
+                    return (status, default_preview, 0, status)
+                elif array_index >= len(_DATA_TEMP_STORAGE[var_name]):
+                    status = f"Index {array_index} out of range (array size: {len(_DATA_TEMP_STORAGE[var_name])})"
+                    return (status, default_preview, len(_DATA_TEMP_STORAGE[var_name]), status)
+                else:
+                    _DATA_TEMP_STORAGE[var_name].pop(array_index)
+                    new_size = len(_DATA_TEMP_STORAGE[var_name])
+                    status = f"Removed item at index {array_index} from array '{var_name}'"
+                    info = f"Array size: {new_size}"
+                    logger.info(f"DataTmpSet: {status}")
+                    return (status, default_preview, new_size, info)
 
             # 根據資料類型選擇資料
             if data_type == "text":
                 data = text_data
+                preview = default_preview
             elif data_type == "image":
                 data = image_data
+                # 使用輸入圖片作為預覽
+                if isinstance(data, torch.Tensor):
+                    if len(data.shape) == 3:
+                        preview = data.unsqueeze(0)
+                    else:
+                        preview = data
+                else:
+                    preview = default_preview
             elif data_type == "any":
                 data = any_data
+                # 如果 any 是圖片，也顯示預覽
+                if isinstance(data, torch.Tensor):
+                    if len(data.shape) == 3:
+                        preview = data.unsqueeze(0)
+                    else:
+                        preview = data
+                else:
+                    preview = default_preview
             else:
-                return (f"Error: Unknown data type {data_type}",)
+                return (f"Error: Unknown data type {data_type}", default_preview, 0, "Error")
 
-            # 根據存儲模式處理
-            if storage_mode == "variable":
+            # 設置變數
+            if operation == "set_variable":
                 _DATA_TEMP_STORAGE[var_name] = data
                 status = f"Stored data in variable '{var_name}'"
+                array_size = 0
+                info = f"Type: {data_type} | Mode: variable"
             
-            elif storage_mode == "array":
-                # 初始化陣列（如果不存在）
+            # 陣列操作
+            elif operation == "array_push":
+                # 初始化陣列（如果不存在或不是列表）
                 if var_name not in _DATA_TEMP_STORAGE or not isinstance(_DATA_TEMP_STORAGE[var_name], list):
                     _DATA_TEMP_STORAGE[var_name] = []
                 
-                # 添加或設置資料
-                if array_index == -1:
-                    # 添加到末尾
-                    _DATA_TEMP_STORAGE[var_name].append(data)
-                    status = f"Appended data to array '{var_name}' (index {len(_DATA_TEMP_STORAGE[var_name]) - 1})"
-                else:
-                    # 設置指定索引
-                    # 如果索引超出範圍，擴展陣列
-                    while len(_DATA_TEMP_STORAGE[var_name]) <= array_index:
-                        _DATA_TEMP_STORAGE[var_name].append(None)
-                    _DATA_TEMP_STORAGE[var_name][array_index] = data
-                    status = f"Set data in array '{var_name}' at index {array_index}"
+                # 添加到末尾
+                _DATA_TEMP_STORAGE[var_name].append(data)
+                array_size = len(_DATA_TEMP_STORAGE[var_name])
+                status = f"Pushed data to array '{var_name}' at index {array_size - 1}"
+                info = f"Type: {data_type} | Array size: {array_size}"
+            
+            elif operation == "array_set_index":
+                # 初始化陣列（如果不存在或不是列表）
+                if var_name not in _DATA_TEMP_STORAGE or not isinstance(_DATA_TEMP_STORAGE[var_name], list):
+                    _DATA_TEMP_STORAGE[var_name] = []
+                
+                # 如果索引超出範圍，擴展陣列
+                while len(_DATA_TEMP_STORAGE[var_name]) <= array_index:
+                    _DATA_TEMP_STORAGE[var_name].append(None)
+                
+                _DATA_TEMP_STORAGE[var_name][array_index] = data
+                array_size = len(_DATA_TEMP_STORAGE[var_name])
+                status = f"Set data in array '{var_name}' at index {array_index}"
+                info = f"Type: {data_type} | Array size: {array_size}"
 
             logger.info(f"DataTmpSet: {status}")
-            return (status,)
+            return (status, preview, array_size, info)
 
         except Exception as e:
             logger.error(f"Error in DataTmpSet: {str(e)}")
-            return (f"Error: {str(e)}",)
+            import traceback
+            traceback.print_exc()
+            default_preview = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return (f"Error: {str(e)}", default_preview, 0, f"Error: {str(e)}")
 
 class DataTmpGet:
     """資料暫存器讀取節點
@@ -1338,63 +1515,308 @@ class DataTmpGet:
             "required": {
                 "var_name": ("STRING", {"default": "my_var", "multiline": False}),
                 "data_type": (["text", "image", "any"], {"default": "text"}),
+                "read_mode": (["index", "first", "last", "all"], {"default": "index"}),
             },
             "optional": {
-                "array_index": ("INT", {"default": -1, "min": -1, "max": 10000}),  # -1 表示不使用索引
+                "array_index": ("INT", {"default": 0, "min": 0, "max": 10000}),
                 "default_text": ("STRING", {"default": "", "multiline": True}),
             }
         }
 
-    RETURN_TYPES = ("STRING", "IMAGE", "*", "STRING")
-    RETURN_NAMES = ("text", "image", "any", "status")
+    RETURN_TYPES = ("STRING", "IMAGE", "*", "INT", "*", "STRING")
+    RETURN_NAMES = ("text", "image", "any", "array_size", "all_elements", "status")
     FUNCTION = "get_data"
     CATEGORY = "TextBatch"
 
-    def get_data(self, var_name, data_type, array_index=-1, default_text=""):
+    def get_data(self, var_name, data_type, read_mode, array_index=0, default_text=""):
         try:
             global _DATA_TEMP_STORAGE
+
+            # 創建一個空白圖片作為錯誤時的預設返回值
+            default_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
 
             # 檢查變數是否存在
             if var_name not in _DATA_TEMP_STORAGE:
                 status = f"Variable '{var_name}' not found, using default"
-                return (default_text, None, None, status)
+                return (default_text, default_image, None, 0, None, status)
 
-            data = _DATA_TEMP_STORAGE[var_name]
+            stored_data = _DATA_TEMP_STORAGE[var_name]
+            
+            # 獲取陣列大小和所有元素
+            array_size = len(stored_data) if isinstance(stored_data, list) else 0
+            all_elements = stored_data if isinstance(stored_data, list) else [stored_data]
 
-            # 如果是陣列模式
-            if array_index >= 0:
-                if not isinstance(data, list):
-                    status = f"Error: '{var_name}' is not an array"
-                    return (default_text, None, None, status)
+            # 根據讀取模式處理
+            if isinstance(stored_data, list) and array_size > 0:
+                if read_mode == "first":
+                    # 讀取第一個
+                    data = stored_data[0]
+                    status = f"Retrieved first item from array '{var_name}' (size: {array_size})"
                 
-                if array_index >= len(data):
-                    status = f"Error: Index {array_index} out of range (array size: {len(data)})"
-                    return (default_text, None, None, status)
+                elif read_mode == "last":
+                    # 讀取最後一個
+                    data = stored_data[-1]
+                    status = f"Retrieved last item from array '{var_name}' (size: {array_size})"
                 
-                data = data[array_index]
-                status = f"Retrieved data from array '{var_name}' at index {array_index}"
+                elif read_mode == "all":
+                    # 讀取全部（特殊處理圖片類型）
+                    if data_type == "image":
+                        # 合併所有圖片到一個批次
+                        try:
+                            valid_images = []
+                            for idx, item in enumerate(stored_data):
+                                if isinstance(item, torch.Tensor):
+                                    # 確保是 4D 張量 [B, H, W, C]
+                                    if len(item.shape) == 3:
+                                        item = item.unsqueeze(0)
+                                    valid_images.append(item)
+                                else:
+                                    logger.warning(f"Item at index {idx} is not a tensor, skipping")
+                            
+                            if len(valid_images) == 0:
+                                status = f"No valid images found in array '{var_name}'"
+                                return ("", default_image, None, array_size, all_elements, status)
+                            
+                            # 合併所有圖片
+                            combined_images = torch.cat(valid_images, dim=0)
+                            status = f"Retrieved all {len(valid_images)} images from array '{var_name}'"
+                            return ("", combined_images, None, array_size, all_elements, status)
+                        except Exception as e:
+                            logger.error(f"Error combining images: {str(e)}")
+                            status = f"Error combining images: {str(e)}"
+                            return ("", default_image, None, array_size, all_elements, status)
+                    else:
+                        # 非圖片類型，返回整個列表
+                        data = stored_data
+                        status = f"Retrieved entire array '{var_name}' (size: {array_size})"
+                
+                elif read_mode == "index":
+                    # 讀取指定索引
+                    if array_index >= len(stored_data):
+                        status = f"Error: Index {array_index} out of range (array size: {len(stored_data)})"
+                        return (default_text, default_image, None, array_size, all_elements, status)
+                    
+                    data = stored_data[array_index]
+                    status = f"Retrieved item at index {array_index} from array '{var_name}' (size: {array_size})"
+                
+                else:
+                    status = f"Unknown read_mode: {read_mode}"
+                    return (default_text, default_image, None, array_size, all_elements, status)
+            
+            elif isinstance(stored_data, list) and array_size == 0:
+                # 空陣列
+                status = f"Array '{var_name}' is empty"
+                return (default_text, default_image, None, 0, [], status)
+            
             else:
-                status = f"Retrieved data from variable '{var_name}'"
+                # 不是陣列，直接返回變數
+                data = stored_data
+                status = f"Retrieved data from variable '{var_name}' (not an array)"
 
             # 根據資料類型返回
             if data_type == "text":
                 if isinstance(data, str):
-                    return (data, None, None, status)
+                    return (data, default_image, None, array_size, all_elements, status)
+                elif isinstance(data, list):
+                    # 將列表轉換為字串
+                    return (str(data), default_image, None, array_size, all_elements, status)
                 else:
-                    return (str(data), None, None, status)
+                    return (str(data), default_image, None, array_size, all_elements, status)
             elif data_type == "image":
                 if isinstance(data, torch.Tensor):
-                    return ("", data, None, status)
+                    # 確保是正確的格式
+                    if len(data.shape) == 3:
+                        data = data.unsqueeze(0)
+                    return ("", data, None, array_size, all_elements, status)
                 else:
-                    return ("", None, None, f"Error: Data is not an image tensor")
+                    error_msg = f"Error: Data is not an image tensor (type: {type(data).__name__})"
+                    logger.error(error_msg)
+                    return ("", default_image, None, array_size, all_elements, error_msg)
             elif data_type == "any":
-                return ("", None, data, status)
+                # 對於 any 類型，如果是圖片也放在 any 輸出
+                if isinstance(data, torch.Tensor):
+                    return ("", data, data, array_size, all_elements, status)
+                else:
+                    return ("", default_image, data, array_size, all_elements, status)
 
-            return (default_text, None, None, "Error: Unknown data type")
+            return (default_text, default_image, None, array_size, all_elements, "Error: Unknown data type")
 
         except Exception as e:
             logger.error(f"Error in DataTmpGet: {str(e)}")
-            return (default_text, None, None, f"Error: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # 創建一個空白圖片作為錯誤返回
+            default_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return (default_text, default_image, None, 0, None, f"Error: {str(e)}")
+
+class TextArrayIndex:
+    """文本陣列索引節點
+    可以輸入多個文本陣列並合併，然後輸出指定索引的文本
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "index": ("INT", {"default": 0, "min": 0, "max": 10000}),
+            },
+            "optional": {
+                "array_1": ("*",),
+                "array_2": ("*",),
+                "array_3": ("*",),
+                "array_4": ("*",),
+                "array_5": ("*",),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT", "STRING")
+    RETURN_NAMES = ("text", "total", "status")
+    FUNCTION = "process"
+    CATEGORY = "TextBatch"
+
+    def process(self, index, array_1=None, array_2=None, array_3=None, array_4=None, array_5=None):
+        try:
+            # 合併所有輸入的陣列
+            merged_array = []
+            
+            for arr in [array_1, array_2, array_3, array_4, array_5]:
+                if arr is None:
+                    continue
+                
+                # 處理不同類型的輸入
+                if isinstance(arr, list):
+                    # 如果是列表，直接擴展
+                    merged_array.extend([str(item) for item in arr])
+                elif isinstance(arr, str):
+                    # 如果是字串，當作單個元素
+                    merged_array.append(arr)
+                else:
+                    # 其他類型，轉換為字串
+                    merged_array.append(str(arr))
+            
+            total = len(merged_array)
+            
+            if total == 0:
+                return ("", 0, "No arrays provided or all arrays are empty")
+            
+            # 確保索引在有效範圍內
+            if index >= total:
+                status = f"Index {index} out of range (total: {total}), returning last item"
+                index = total - 1
+            else:
+                status = f"Retrieved item {index + 1}/{total}"
+            
+            result_text = merged_array[index]
+            
+            return (result_text, total, status)
+
+        except Exception as e:
+            logger.error(f"Error in TextArrayIndex: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return ("", 0, f"Error: {str(e)}")
+
+class DataTempManager:
+    """資料暫存器管理節點
+    可以查看所有變數、狀態、刪除特定變數或索引
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "action": (["list_all", "delete_var", "delete_index", "clear_all"], {"default": "list_all"}),
+            },
+            "optional": {
+                "var_name": ("STRING", {"default": "", "multiline": False}),
+                "array_index": ("INT", {"default": 0, "min": 0, "max": 10000}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "INT")
+    RETURN_NAMES = ("variables_list", "status", "total_vars")
+    FUNCTION = "manage"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def manage(self, action, var_name="", array_index=0):
+        try:
+            global _DATA_TEMP_STORAGE
+
+            if action == "list_all":
+                # 列出所有變數及其狀態
+                if len(_DATA_TEMP_STORAGE) == 0:
+                    return ("No variables stored", "Empty storage", 0)
+                
+                var_list = []
+                for name, value in _DATA_TEMP_STORAGE.items():
+                    if isinstance(value, list):
+                        size = len(value)
+                        types = set(type(item).__name__ for item in value[:5])  # 檢查前5個元素的類型
+                        var_info = f"{name}: Array[{size}] - Types: {', '.join(types)}"
+                    elif isinstance(value, torch.Tensor):
+                        shape = tuple(value.shape)
+                        var_info = f"{name}: Tensor{shape}"
+                    elif isinstance(value, str):
+                        preview = value[:50] + "..." if len(value) > 50 else value
+                        var_info = f"{name}: String - '{preview}'"
+                    else:
+                        var_info = f"{name}: {type(value).__name__}"
+                    var_list.append(var_info)
+                
+                variables_text = "\n".join(var_list)
+                status = f"Found {len(_DATA_TEMP_STORAGE)} variables"
+                return (variables_text, status, len(_DATA_TEMP_STORAGE))
+            
+            elif action == "delete_var":
+                # 刪除特定變數
+                if not var_name:
+                    return ("", "Error: Please specify var_name", 0)
+                
+                if var_name in _DATA_TEMP_STORAGE:
+                    del _DATA_TEMP_STORAGE[var_name]
+                    status = f"Deleted variable '{var_name}'"
+                    logger.info(f"DataTempManager: {status}")
+                else:
+                    status = f"Variable '{var_name}' not found"
+                
+                return ("", status, len(_DATA_TEMP_STORAGE))
+            
+            elif action == "delete_index":
+                # 刪除陣列中的特定索引
+                if not var_name:
+                    return ("", "Error: Please specify var_name", 0)
+                
+                if var_name not in _DATA_TEMP_STORAGE:
+                    return ("", f"Variable '{var_name}' not found", 0)
+                
+                value = _DATA_TEMP_STORAGE[var_name]
+                if not isinstance(value, list):
+                    return ("", f"Variable '{var_name}' is not an array", 0)
+                
+                if array_index >= len(value):
+                    return ("", f"Index {array_index} out of range (size: {len(value)})", 0)
+                
+                value.pop(array_index)
+                status = f"Deleted index {array_index} from '{var_name}' (new size: {len(value)})"
+                logger.info(f"DataTempManager: {status}")
+                return ("", status, len(_DATA_TEMP_STORAGE))
+            
+            elif action == "clear_all":
+                # 清除所有變數
+                count = len(_DATA_TEMP_STORAGE)
+                _DATA_TEMP_STORAGE.clear()
+                status = f"Cleared all {count} variables"
+                logger.info(f"DataTempManager: {status}")
+                return ("", status, 0)
+            
+            return ("", f"Unknown action: {action}", len(_DATA_TEMP_STORAGE))
+
+        except Exception as e:
+            logger.error(f"Error in DataTempManager: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return ("", f"Error: {str(e)}", 0)
 
 # 節點類映射
 NODE_CLASS_MAPPINGS = {
@@ -1406,11 +1828,13 @@ NODE_CLASS_MAPPINGS = {
     "PathParser": PathParserNode,
     "LoadImagesFromDirBatch": LoadImagesFromDirBatchM,
     "ImageFilenameProcessor": ImageFilenameProcessor,
-    "ImageQueueProcessorPlus": ImageQueueProcessorPlus,  # 新增
-    "TextSplitGet": TextSplitGet,  # 新增
-    "IFMatchCond": IFMatchCond,  # 新增
-    "DataTmpSet": DataTmpSet,  # 新增
-    "DataTmpGet": DataTmpGet  # 新增
+    "ImageQueueProcessorPlus": ImageQueueProcessorPlus,
+    "TextSplitGet": TextSplitGet,
+    "IFMatchCond": IFMatchCond,
+    "DataTmpSet": DataTmpSet,
+    "DataTmpGet": DataTmpGet,
+    "TextArrayIndex": TextArrayIndex,  # 新增
+    "DataTempManager": DataTempManager  # 新增
 }
 
 # 節點顯示名稱映射
@@ -1423,9 +1847,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PathParser": "Path Parser",
     "LoadImagesFromDirBatch": "Load Images From Dir Batch",
     "ImageFilenameProcessor": "Image Filename Processor",
-    "ImageQueueProcessorPlus": "Image Queue Processor Plus",  # 新增
-    "TextSplitGet": "Text Split Get",  # 新增
-    "IFMatchCond": "IF Match Condition",  # 新增
-    "DataTmpSet": "Data Temp Set",  # 新增
-    "DataTmpGet": "Data Temp Get"  # 新增
+    "ImageQueueProcessorPlus": "Image Queue Processor Plus",
+    "TextSplitGet": "Text Split Get",
+    "IFMatchCond": "IF Match Condition",
+    "DataTmpSet": "Data Temp Set",
+    "DataTmpGet": "Data Temp Get",
+    "TextArrayIndex": "Text Array Index",  # 新增
+    "DataTempManager": "Data Temp Manager"  # 新增
 }
