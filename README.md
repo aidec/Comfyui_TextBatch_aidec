@@ -1,3 +1,6 @@
+關注Blog：https://blog.aidec.tw/
+Youtube：https://www.youtube.com/channel/UClGTLsGrMvGOl3tXoDQHQjg
+
 # Comfyui_TextBatch_aidec
 可以將Text每行分割成一組，批量執行
 
