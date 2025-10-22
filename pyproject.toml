@@ -1,0 +1,14 @@
+[project]
+name = "textbatch_aidec"
+description = "The Text Queue Processor can split text into groups line by line for batch processing (unfinished, with noticeable bugs still being fixed). Currently, on the first run, it may only process one item. Once that is completed, running it again usually works fine. After each run, the `start_index` needs to be manually reset. Occasionally, strange issues occur, such as multiple queues being added at once, while other times it works perfectly fine. The potential causes are still under investigation."
+version = "1.0.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/aidec/Comfyui_TextBatch_aidec"
+#  Used by Comfy Registry https://comfyregistry.org
+
+[tool.comfy]
+PublisherId = ""
+DisplayName = "Comfyui_TextBatch_aidec"
+Icon = ""
