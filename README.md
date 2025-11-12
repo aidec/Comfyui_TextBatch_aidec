@@ -32,6 +32,8 @@ Text Queue Processor
 增加了 Image Queue Processor Pro節點，此節點可以直接設定讀取的資料夾，將資料夾圖片檔名分組，指定index才讀取圖片。
 跟之前的Image Queue Processor不同，之前的Image Queue Processor是先將所有圖片讀取到記憶體，再依照index讀取圖片，這樣會大幅占用記憶體。新版的pro節點，只讀取資料夾檔案清單，並讀取對應index的圖片，不會占用記憶體。推薦使用這個節點來進行批量圖生圖。
 舊版本的大概只支援100~200張左右的圖片就會吃掉好幾GB的記憶體，新版的pro節點目錄中有200張圖大概只吃20MB左右的記憶體。
+<img width="400" height="380" alt="image" src="https://github.com/user-attachments/assets/10f043cd-ebe0-44ed-9ebc-4e3d687d68a7" />
+
  
 
 ### 新增功能Image Queue Processor(批量圖生圖)：
