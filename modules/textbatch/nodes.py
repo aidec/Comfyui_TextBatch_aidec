@@ -12,6 +12,7 @@ import comfy
 import folder_paths
 import base64
 from io import BytesIO
+import hashlib
 
 # 設定基本的日誌記錄格式和級別
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -945,6 +946,367 @@ class ImageFilenameProcessor:
             logger.error(f"處理檔名時發生錯誤: {str(e)}")
             return ("", "", "", "", 0, f"錯誤: {str(e)}")
 
+class LoadImageByIndex:
+    """根據索引延遲載入單張圖片
+    只讀取指定索引的圖片到記憶體，避免一次性載入所有圖片
+    適合用於預覽、選擇性處理等場景
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "directory": ("STRING", {"default": ""}),
+                "index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "step": 1,
+                    "display": "number"
+                }),
+            },
+            "optional": {
+                "load_always": ("BOOLEAN", {
+                    "default": False, 
+                    "label_on": "enabled", 
+                    "label_off": "disabled"
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "STRING", "INT", "STRING")
+    RETURN_NAMES = ("image", "mask", "filename", "full_path", "total_files", "status")
+    FUNCTION = "load_image_by_index"
+    CATEGORY = "image"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        if 'load_always' in kwargs and kwargs['load_always']:
+            return float("NaN")
+        else:
+            return hash(frozenset(kwargs.items()))
+
+    def load_image_by_index(self, directory: str, index: int = 0, load_always=False):
+        try:
+            # 驗證目錄
+            if not os.path.isdir(directory):
+                raise FileNotFoundError(f"目錄 '{directory}' 不存在")
+            
+            # 獲取所有圖片檔案列表（只讀取檔名，不載入圖片）
+            dir_files = os.listdir(directory)
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            dir_files = [f for f in dir_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+            
+            if len(dir_files) == 0:
+                raise FileNotFoundError(f"目錄 '{directory}' 中沒有圖片檔案")
+            
+            # 排序檔案列表
+            dir_files = sorted(dir_files)
+            total_files = len(dir_files)
+            
+            # 確保索引在有效範圍內
+            if index < 0:
+                index = 0
+            if index >= total_files:
+                index = total_files - 1
+            
+            # 只載入指定索引的圖片
+            filename = dir_files[index]
+            image_path = os.path.join(directory, filename)
+            
+            # 載入圖片
+            i = Image.open(image_path)
+            i = ImageOps.exif_transpose(i)
+            image = i.convert("RGB")
+            image = np.array(image).astype(np.float32) / 255.0
+            image = torch.from_numpy(image)[None,]
+            
+            # 處理遮罩
+            if 'A' in i.getbands():
+                mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                mask = 1. - torch.from_numpy(mask)
+            else:
+                mask = torch.zeros((image.shape[1], image.shape[2]), dtype=torch.float32, device="cpu")
+            
+            # 標準化完整路徑
+            full_path = os.path.abspath(image_path).replace('\\', '/')
+            
+            # 狀態信息
+            status = f"成功載入第 {index + 1}/{total_files} 張圖片"
+            
+            return (image, mask, filename, full_path, total_files, status)
+            
+        except Exception as e:
+            logger.error(f"載入圖片時發生錯誤: {str(e)}")
+            # 返回空圖片
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((64, 64), dtype=torch.float32)
+            return (empty_image, empty_mask, "", "", 0, f"錯誤: {str(e)}")
+
+class LoadImagesFromDirLazy:
+    """延遲載入模式 - 先獲取檔案列表，返回路徑資訊
+    只掃描目錄獲取檔案列表，不載入圖片到記憶體
+    配合 LoadImageByIndex 使用實現完整的延遲載入流程
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "directory": ("STRING", {"default": ""}),
+            },
+            "optional": {
+                "start_index": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "max_files": ("INT", {"default": 0, "min": 0, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "INT", "STRING")
+    RETURN_NAMES = ("filenames", "full_paths", "directory", "total_files", "status")
+    FUNCTION = "scan_directory"
+    CATEGORY = "image"
+
+    def scan_directory(self, directory: str, start_index: int = 0, max_files: int = 0):
+        try:
+            # 驗證目錄
+            if not os.path.isdir(directory):
+                raise FileNotFoundError(f"目錄 '{directory}' 不存在")
+            
+            # 獲取所有圖片檔案列表
+            dir_files = os.listdir(directory)
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            dir_files = [f for f in dir_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+            
+            if len(dir_files) == 0:
+                raise FileNotFoundError(f"目錄 '{directory}' 中沒有圖片檔案")
+            
+            # 排序
+            dir_files = sorted(dir_files)
+            
+            # 應用起始索引
+            if start_index > 0:
+                dir_files = dir_files[start_index:]
+            
+            # 應用數量限制
+            if max_files > 0:
+                dir_files = dir_files[:max_files]
+            
+            total_files = len(dir_files)
+            
+            # 生成檔名列表和完整路徑列表
+            filenames = ",".join(dir_files)
+            full_paths = ",".join([os.path.abspath(os.path.join(directory, f)).replace('\\', '/') for f in dir_files])
+            
+            status = f"掃描到 {total_files} 個圖片檔案（未載入到記憶體）"
+            if start_index > 0:
+                status += f"，起始索引: {start_index}"
+            if max_files > 0:
+                status += f"，限制數量: {max_files}"
+            
+            return (filenames, full_paths, directory, total_files, status)
+            
+        except Exception as e:
+            logger.error(f"掃描目錄時發生錯誤: {str(e)}")
+            return ("", "", "", 0, f"錯誤: {str(e)}")
+
+class ImageQueueProcessorPro:
+    """圖片隊列處理器 Pro 版本
+    不需要預先載入圖片，直接從資料夾按需載入
+    適合處理大量圖片，記憶體友善
+    """
+    def __init__(self):
+        self.state_file = os.path.join(os.path.dirname(__file__), "image_queue_processor_pro_state.json")
+        self.state = self.load_state()
+
+    def reset_state(self, queue_id="default"):
+        """重置指定隊列的狀態"""
+        if queue_id not in self.state:
+            self.state[queue_id] = {}
+        self.state[queue_id] = {
+            "current_index": 0,
+            "last_directory": "",
+            "total_files": 0,
+            "completed": False
+        }
+        self.save_state()
+
+    def load_state(self):
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"載入狀態檔案錯誤: {str(e)}")
+        return {}
+
+    def save_state(self):
+        try:
+            with open(self.state_file, 'w', encoding='utf-8') as f:
+                json.dump(self.state, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"儲存狀態檔案錯誤: {str(e)}")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "directory": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "圖片資料夾路徑"
+                }),
+                "start_index": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 10000,
+                    "step": 1
+                }),
+                "trigger_next": ("BOOLEAN", {
+                    "default": True,
+                    "label_on": "啟用自動觸發",
+                    "label_off": "停止自動觸發"
+                }),
+            },
+            "optional": {
+                "queue_id": ("STRING", {
+                    "default": "default",
+                    "multiline": False,
+                    "placeholder": "隊列ID（可選，用於多個隊列）"
+                }),
+                "reset_queue": ("BOOLEAN", {
+                    "default": False,
+                    "label_on": "重置隊列",
+                    "label_off": "繼續處理"
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "BOOLEAN", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "mask", "current_index", "total", "completed", "filename", "full_path", "status")
+    FUNCTION = "process"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def process(self, directory, start_index, trigger_next, queue_id="default", reset_queue=False, unique_id=None):
+        try:
+            # 驗證目錄
+            if not os.path.isdir(directory):
+                empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                empty_mask = torch.zeros((64, 64), dtype=torch.float32)
+                return (empty_image, empty_mask, -1, 0, True, "", "", f"錯誤：目錄不存在 '{directory}'")
+            
+            # 掃描目錄獲取圖片列表（只讀取檔名，不載入圖片）
+            dir_files = os.listdir(directory)
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            dir_files = [f for f in dir_files if any(f.lower().endswith(ext) for ext in valid_extensions)]
+            
+            if len(dir_files) == 0:
+                empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                empty_mask = torch.zeros((64, 64), dtype=torch.float32)
+                return (empty_image, empty_mask, -1, 0, True, "", "", f"錯誤：目錄中沒有圖片 '{directory}'")
+            
+            # 排序檔案
+            dir_files = sorted(dir_files)
+            total_files = len(dir_files)
+            
+            # 初始化隊列狀態
+            if queue_id not in self.state:
+                self.reset_state(queue_id)
+            
+            queue_state = self.state[queue_id]
+            
+            # 檢查是否需要重置（目錄變更或手動重置）
+            directory_changed = queue_state.get("last_directory") != directory
+            if reset_queue or directory_changed or queue_state.get("completed", False):
+                self.reset_state(queue_id)
+                queue_state = self.state[queue_id]
+                queue_state["last_directory"] = directory
+                queue_state["total_files"] = total_files
+                current_index = start_index
+            else:
+                # 繼續處理
+                current_index = queue_state.get("current_index", start_index)
+            
+            # 確保索引有效
+            if current_index < 0:
+                current_index = 0
+            if current_index >= total_files:
+                current_index = total_files - 1
+            
+            # 載入當前索引的圖片（延遲載入，只載入這一張）
+            filename = dir_files[current_index]
+            image_path = os.path.join(directory, filename)
+            
+            try:
+                # 載入圖片
+                i = Image.open(image_path)
+                i = ImageOps.exif_transpose(i)
+                image = i.convert("RGB")
+                image = np.array(image).astype(np.float32) / 255.0
+                image = torch.from_numpy(image)[None,]
+                
+                # 處理遮罩
+                if 'A' in i.getbands():
+                    mask = np.array(i.getchannel('A')).astype(np.float32) / 255.0
+                    mask = 1. - torch.from_numpy(mask)
+                else:
+                    mask = torch.zeros((image.shape[1], image.shape[2]), dtype=torch.float32, device="cpu")
+                
+                # 標準化完整路徑
+                full_path = os.path.abspath(image_path).replace('\\', '/')
+                
+            except Exception as e:
+                logger.error(f"載入圖片錯誤: {str(e)}")
+                empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+                empty_mask = torch.zeros((64, 64), dtype=torch.float32)
+                return (empty_image, empty_mask, current_index, total_files, True, filename, "", f"錯誤：無法載入圖片 {filename}")
+            
+            # 檢查是否完成
+            is_last = current_index >= total_files - 1
+            
+            # 更新狀態
+            if not is_last and trigger_next:
+                next_index = current_index + 1
+                queue_state["current_index"] = next_index
+                queue_state["completed"] = False
+                self.save_state()
+                
+                # 觸發下一個隊列任務
+                PromptServer.instance.send_sync("textbatch-add-queue", {})
+                completed = False
+            else:
+                queue_state["current_index"] = 0
+                queue_state["completed"] = True
+                self.save_state()
+                completed = True
+            
+            # 生成狀態信息
+            status = f"處理中 {current_index + 1}/{total_files} | {filename}"
+            if completed:
+                status += " | ✅ 完成"
+            
+            # 更新前端顯示
+            if not completed and unique_id:
+                try:
+                    PromptServer.instance.send_sync("textbatch-node-feedback", {
+                        "node_id": unique_id,
+                        "widget_name": "start_index",
+                        "type": "int",
+                        "value": next_index
+                    })
+                except Exception as e:
+                    logger.error(f"更新前端顯示錯誤: {str(e)}")
+            
+            return (image, mask, current_index, total_files, completed, filename, full_path, status)
+            
+        except Exception as e:
+            logger.error(f"處理錯誤: {str(e)}")
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            empty_mask = torch.zeros((64, 64), dtype=torch.float32)
+            return (empty_image, empty_mask, -1, 0, True, "", "", f"錯誤: {str(e)}")
+
 class ImageQueueProcessorPlus:
     """處理圖片佇列的增強節點
     支持兩個圖片輸入，可以將新圖片合併到佇列中實現循環處理
@@ -953,6 +1315,39 @@ class ImageQueueProcessorPlus:
     def __init__(self):
         self.state_file = os.path.join(os.path.dirname(__file__), "image_queue_processor_plus_state.json")
         self.state = self.load_state()
+
+    def calculate_image_md5(self, image_tensor):
+        """計算圖片張量的MD5值"""
+        try:
+            # 將張量轉換為 numpy 陣列並計算 MD5
+            img_np = image_tensor.cpu().numpy()
+            img_bytes = img_np.tobytes()
+            md5_hash = hashlib.md5(img_bytes).hexdigest()
+            return md5_hash
+        except Exception as e:
+            logger.error(f"Error calculating MD5: {str(e)}")
+            return ""
+
+    def get_filename_and_path(self, index, filenames, file_paths):
+        """從逗號分隔的字串中獲取指定索引的檔名和路徑"""
+        try:
+            filename = ""
+            file_path = ""
+            
+            if filenames and filenames.strip():
+                filename_list = [f.strip() for f in filenames.split(',') if f.strip()]
+                if index < len(filename_list):
+                    filename = filename_list[index]
+            
+            if file_paths and file_paths.strip():
+                path_list = [p.strip() for p in file_paths.split(',') if p.strip()]
+                if index < len(path_list):
+                    file_path = path_list[index]
+            
+            return filename, file_path
+        except Exception as e:
+            logger.error(f"Error getting filename and path: {str(e)}")
+            return "", ""
 
     def reset_state(self, queue_id="default"):
         """重置狀態到初始值"""
@@ -1003,6 +1398,8 @@ class ImageQueueProcessorPlus:
                 "additional_image": ("IMAGE",),  # 額外的圖片輸入
                 "data_tmp_var": ("STRING", {"default": "", "multiline": False}),  # 從 DataTmpSet 讀取的變數名稱
                 "use_data_tmp": ("BOOLEAN", {"default": False}),  # 是否使用 DataTmpSet 的資料
+                "filenames": ("STRING", {"default": "", "multiline": False}),  # 逗號分隔的檔名列表
+                "file_paths": ("STRING", {"default": "", "multiline": False}),  # 逗號分隔的路徑列表
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1011,14 +1408,14 @@ class ImageQueueProcessorPlus:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "BOOLEAN", "STRING")
-    RETURN_NAMES = ("image", "current_index", "total", "completed", "status")
+    RETURN_TYPES = ("IMAGE", "INT", "INT", "BOOLEAN", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "current_index", "total", "completed", "status", "filename", "file_path", "md5")
     FUNCTION = "process"
     CATEGORY = "TextBatch"
     OUTPUT_NODE = True
 
     def process(self, images, start_index, max_index, trigger_next, enable_loop, unique_id, 
-                additional_image=None, data_tmp_var="", use_data_tmp=False, prompt=None, extra_pnginfo=None):
+                additional_image=None, data_tmp_var="", use_data_tmp=False, filenames="", file_paths="", prompt=None, extra_pnginfo=None):
         try:
             global _IMAGE_QUEUE_STORAGE, _DATA_TEMP_STORAGE
             
@@ -1029,7 +1426,7 @@ class ImageQueueProcessorPlus:
             if not isinstance(images, torch.Tensor):
                 # 創建一個空白圖片作為錯誤返回
                 error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-                return (error_image, -1, 0, True, "Invalid input: not a tensor")
+                return (error_image, -1, 0, True, "Invalid input: not a tensor", "", "", "")
 
             # 處理單張圖片的情況
             if len(images.shape) == 3:
@@ -1127,7 +1524,7 @@ class ImageQueueProcessorPlus:
             if total == 0:
                 # 創建一個空白圖片作為錯誤返回
                 error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-                return (error_image, -1, 0, True, "No images in queue")
+                return (error_image, -1, 0, True, "No images in queue", "", "", "")
 
             # 如果當前索引超出範圍，表示已經處理完所有圖片
             if current_index >= total:
@@ -1137,7 +1534,7 @@ class ImageQueueProcessorPlus:
                 self.save_state()
                 # 返回最後一張圖片
                 error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-                return (error_image, current_index, total, True, f"Completed: index {current_index} >= total {total}")
+                return (error_image, current_index, total, True, f"Completed: index {current_index} >= total {total}", "", "", "")
 
             # 獲取當前圖片
             current_image = _IMAGE_QUEUE_STORAGE[queue_id][current_index]
@@ -1209,7 +1606,14 @@ class ImageQueueProcessorPlus:
                 PromptServer.instance.send_sync("textbatch-node-feedback", 
                     {"node_id": unique_id, "widget_name": "start_index", "type": "int", "value": self.state["current_index"]})
 
-            return (current_image, current_index, total, completed, status)
+            # ========== 計算 MD5 和獲取檔名/路徑 ==========
+            # 計算當前圖片的 MD5
+            md5_value = self.calculate_image_md5(current_image)
+            
+            # 獲取檔名和路徑
+            filename, file_path = self.get_filename_and_path(current_index, filenames, file_paths)
+
+            return (current_image, current_index, total, completed, status, filename, file_path, md5_value)
 
         except Exception as e:
             logger.error(f"Error in ImageQueueProcessorPlus: {str(e)}")
@@ -1217,7 +1621,7 @@ class ImageQueueProcessorPlus:
             traceback.print_exc()
             # 創建一個空白圖片作為錯誤返回
             error_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return (error_image, -1, 0, True, f"Error: {str(e)}")
+            return (error_image, -1, 0, True, f"Error: {str(e)}", "", "", "")
 
 class TextSplitGet:
     """文本分割並獲取指定索引的節點
@@ -1818,23 +2222,546 @@ class DataTempManager:
             traceback.print_exc()
             return ("", f"Error: {str(e)}", 0)
 
+class GroupController:
+    """群組控制器節點
+    動態控制所有群組的啟用/停用狀態
+    每個群組都有獨立的 BOOLEAN input 來控制
+    類似於 rgthree 的 Fast Groups Bypasser
+    """
+    
+    def __init__(self):
+        self.group_states_file = os.path.join(os.path.dirname(__file__), "group_controller_states.json")
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "control_mode": (["bypass", "mute"], {"default": "bypass"}),
+            },
+            "optional": {
+                # 這裡會動態添加群組的 input
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "control_groups"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def control_groups(self, control_mode, unique_id=None, **kwargs):
+        """
+        控制群組的啟用/停用狀態
+        kwargs 會包含所有動態添加的群組控制參數
+        """
+        try:
+            # 收集所有群組的啟用狀態
+            group_states = {}
+            for key, value in kwargs.items():
+                if key.startswith("enable_group_"):
+                    group_id = key.replace("enable_group_", "")
+                    group_states[group_id] = value
+            
+            # 生成狀態信息
+            enabled_count = sum(1 for v in group_states.values() if v)
+            total_count = len(group_states)
+            
+            status = f"Mode: {control_mode} | Groups: {enabled_count}/{total_count} enabled"
+            
+            # 將狀態信息發送到前端
+            if unique_id:
+                PromptServer.instance.send_sync("groupcontroller-update", {
+                    "node_id": unique_id,
+                    "group_states": group_states,
+                    "control_mode": control_mode
+                })
+            
+            return (status,)
+
+        except Exception as e:
+            logger.error(f"Error in GroupController: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return (f"Error: {str(e)}",)
+
+class UniversalLoopController:
+    """萬用循環控制器節點
+    可以設定循環次數，自動執行指定次數的循環
+    支援多個輸入輸出，並在循環完成後輸出所有累積的結果
+    """
+    def __init__(self):
+        self.state_file = os.path.join(os.path.dirname(__file__), "universal_loop_state.json")
+        self.state = self.load_state()
+
+    def reset_state(self, loop_id="default"):
+        """重置狀態到初始值"""
+        self.state = {
+            "current_loop": 0,
+            "last_config": "",
+            "completed": False,
+            "accumulated_data": []
+        }
+        self.save_state()
+
+    def load_state(self):
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading state file: {str(e)}")
+        return {
+            "current_loop": 0,
+            "last_config": "",
+            "completed": False,
+            "accumulated_data": []
+        }
+
+    def save_state(self):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.state, f)
+        except Exception as e:
+            logger.error(f"Error saving state file: {str(e)}")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "loop_count": ("INT", {"default": 3, "min": 1, "max": 1000}),
+                "accumulate_mode": (["none", "text", "image", "any"], {"default": "none"}),
+                "trigger_next": ("BOOLEAN", {"default": True, "label_on": "Trigger", "label_off": "Don't trigger"}),
+                "reset_on_start": ("BOOLEAN", {"default": True, "label_on": "Yes", "label_off": "No"}),
+            },
+            "optional": {
+                # 支援多個輸入
+                "input_1": ("*",),
+                "input_2": ("*",),
+                "input_3": ("*",),
+                "input_4": ("*",),
+                "input_5": ("*",),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO"
+            }
+        }
+
+    RETURN_TYPES = ("INT", "INT", "BOOLEAN", "*", "*", "*", "*", "*", "*", "STRING")
+    RETURN_NAMES = ("current_loop", "total_loops", "completed", 
+                    "output_1", "output_2", "output_3", "output_4", "output_5", 
+                    "accumulated_results", "status")
+    FUNCTION = "process_loop"
+    CATEGORY = "TextBatch"
+    OUTPUT_NODE = True
+
+    def process_loop(self, loop_count, accumulate_mode, trigger_next, reset_on_start, unique_id,
+                    input_1=None, input_2=None, input_3=None, input_4=None, input_5=None,
+                    prompt=None, extra_pnginfo=None):
+        """
+        處理循環邏輯
+        """
+        try:
+            global _DATA_TEMP_STORAGE
+            
+            # 使用 unique_id 作為循環標識
+            loop_id = unique_id if unique_id else "default"
+            
+            # 生成配置標識
+            config_hash = str(hash(f"{loop_count}_{accumulate_mode}_{reset_on_start}"))
+            
+            # 檢查是否需要重置
+            need_reset = (
+                self.state.get("last_config") != config_hash or
+                self.state.get("completed", False) or
+                (prompt and extra_pnginfo and reset_on_start)
+            )
+
+            if need_reset:
+                self.reset_state(loop_id)
+                self.state["last_config"] = config_hash
+                current_loop = 0
+                logger.info(f"Loop controller reset for {loop_id}, will run {loop_count} times")
+            else:
+                current_loop = self.state.get("current_loop", 0)
+
+            # 檢查是否已完成
+            if current_loop >= loop_count:
+                logger.info(f"Loop completed: {current_loop}/{loop_count}")
+                self.state["current_loop"] = 0
+                self.state["completed"] = True
+                self.save_state()
+                
+                # 返回累積的結果
+                accumulated_results = self.state.get("accumulated_data", [])
+                return (
+                    current_loop, loop_count, True,
+                    input_1, input_2, input_3, input_4, input_5,
+                    accumulated_results,
+                    f"Completed: {loop_count}/{loop_count} loops"
+                )
+
+            # 當前循環處理
+            logger.info(f"Processing loop {current_loop + 1}/{loop_count}")
+            
+            # 累積資料（如果啟用）
+            if accumulate_mode != "none":
+                if "accumulated_data" not in self.state:
+                    self.state["accumulated_data"] = []
+                
+                # 根據模式累積資料
+                loop_data = {
+                    "loop_index": current_loop,
+                    "input_1": self._serialize_data(input_1, accumulate_mode),
+                    "input_2": self._serialize_data(input_2, accumulate_mode),
+                    "input_3": self._serialize_data(input_3, accumulate_mode),
+                    "input_4": self._serialize_data(input_4, accumulate_mode),
+                    "input_5": self._serialize_data(input_5, accumulate_mode),
+                }
+                self.state["accumulated_data"].append(loop_data)
+
+            # 決定是否繼續到下一輪
+            next_loop = current_loop + 1
+            is_last = next_loop >= loop_count
+            
+            if not is_last and trigger_next:
+                self.state["current_loop"] = next_loop
+                completed = False
+                logger.info(f"Continue to next loop: {next_loop}")
+                
+                # 發送佇列事件
+                PromptServer.instance.send_sync("textbatch-add-queue", {})
+            else:
+                completed = True
+                self.state["current_loop"] = next_loop
+                self.state["completed"] = True
+
+            self.save_state()
+
+            # 生成狀態信息
+            status = f"Loop {current_loop + 1}/{loop_count}"
+            if accumulate_mode != "none":
+                status += f" | Accumulating: {accumulate_mode}"
+            if completed:
+                status += " | Completed"
+
+            # 更新節點顯示的當前循環
+            if not completed:
+                PromptServer.instance.send_sync("textbatch-node-feedback", 
+                    {"node_id": unique_id, "widget_name": "loop_count", "type": "int", "value": next_loop})
+
+            accumulated_results = self.state.get("accumulated_data", [])
+            
+            return (
+                current_loop, loop_count, completed,
+                input_1, input_2, input_3, input_4, input_5,
+                accumulated_results,
+                status
+            )
+
+        except Exception as e:
+            logger.error(f"Error in UniversalLoopController: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return (0, loop_count, True, None, None, None, None, None, [], f"Error: {str(e)}")
+
+    def _serialize_data(self, data, mode):
+        """序列化資料以便累積"""
+        try:
+            if data is None:
+                return None
+            
+            if mode == "text":
+                return str(data)
+            elif mode == "image":
+                if isinstance(data, torch.Tensor):
+                    # 對於圖片，我們只儲存形狀信息，不儲存實際資料（太大）
+                    return f"Image tensor: shape={tuple(data.shape)}"
+                return str(data)
+            elif mode == "any":
+                if isinstance(data, torch.Tensor):
+                    return f"Tensor: shape={tuple(data.shape)}"
+                elif isinstance(data, (list, dict)):
+                    return data
+                else:
+                    return str(data)
+            else:
+                return None
+        except Exception as e:
+            logger.error(f"Error serializing data: {str(e)}")
+            return None
+
+class LoopResultExtractor:
+    """循環結果提取器
+    用於從 UniversalLoopController 的累積結果中提取特定循環的資料
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "accumulated_results": ("*",),
+                "extract_mode": (["specific_index", "all_as_text", "count"], {"default": "specific_index"}),
+            },
+            "optional": {
+                "loop_index": ("INT", {"default": 0, "min": 0, "max": 1000}),
+                "output_field": (["input_1", "input_2", "input_3", "input_4", "input_5"], {"default": "input_1"}),
+            }
+        }
+
+    RETURN_TYPES = ("*", "STRING", "INT", "STRING")
+    RETURN_NAMES = ("extracted_data", "text_output", "count", "status")
+    FUNCTION = "extract"
+    CATEGORY = "TextBatch"
+
+    def extract(self, accumulated_results, extract_mode, loop_index=0, output_field="input_1"):
+        """
+        從累積結果中提取資料
+        """
+        try:
+            if not accumulated_results or not isinstance(accumulated_results, list):
+                return (None, "", 0, "No accumulated results")
+
+            count = len(accumulated_results)
+
+            if extract_mode == "count":
+                return (None, str(count), count, f"Total loops: {count}")
+
+            elif extract_mode == "all_as_text":
+                # 將所有結果轉換為文本
+                text_output = json.dumps(accumulated_results, indent=2, ensure_ascii=False)
+                return (accumulated_results, text_output, count, f"Extracted all {count} results as text")
+
+            elif extract_mode == "specific_index":
+                # 提取特定索引的資料
+                if loop_index >= count:
+                    return (None, "", count, f"Index {loop_index} out of range (total: {count})")
+
+                loop_data = accumulated_results[loop_index]
+                extracted = loop_data.get(output_field, None)
+                
+                text_output = str(extracted) if extracted is not None else ""
+                status = f"Extracted loop {loop_index + 1}/{count}, field: {output_field}"
+                
+                return (extracted, text_output, count, status)
+
+            return (None, "", count, f"Unknown extract mode: {extract_mode}")
+
+        except Exception as e:
+            logger.error(f"Error in LoopResultExtractor: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return (None, "", 0, f"Error: {str(e)}")
+
+class JsonQueryNode:
+    """JSON 查詢節點
+    可以載入 JSON 文本或檔案，並通過 KEY 和欄位路徑來查詢資料
+    支援多組輸入和輸出，支援 a.b.c.d 這樣的路徑查詢
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "input_mode": (["text", "file"], {"default": "text"}),
+                "json_text": ("STRING", {
+                    "multiline": True,
+                    "default": '{"a": {"name": "myname", "prompts": "mycustom prompt"}}',
+                    "placeholder": "輸入 JSON 文本"
+                }),
+                "json_file": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "輸入 JSON 檔案路徑"
+                }),
+            },
+            "optional": {
+                # 支援最多 5 組查詢
+                "key_1": ("STRING", {"default": "", "multiline": False}),
+                "field_1": ("STRING", {"default": "", "multiline": False}),
+                
+                "key_2": ("STRING", {"default": "", "multiline": False}),
+                "field_2": ("STRING", {"default": "", "multiline": False}),
+                
+                "key_3": ("STRING", {"default": "", "multiline": False}),
+                "field_3": ("STRING", {"default": "", "multiline": False}),
+                
+                "key_4": ("STRING", {"default": "", "multiline": False}),
+                "field_4": ("STRING", {"default": "", "multiline": False}),
+                
+                "key_5": ("STRING", {"default": "", "multiline": False}),
+                "field_5": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("output_1", "output_2", "output_3", "output_4", "output_5", "status")
+    FUNCTION = "query_json"
+    CATEGORY = "TextBatch"
+
+    def query_json(self, input_mode, json_text, json_file, 
+                   key_1="", field_1="", key_2="", field_2="", 
+                   key_3="", field_3="", key_4="", field_4="", 
+                   key_5="", field_5=""):
+        """
+        查詢 JSON 資料
+        支援路徑查詢，例如：key='a', field='b.c.d' 或直接 key='a.b.c.d'
+        """
+        try:
+            # 載入 JSON 資料
+            json_data = None
+            
+            if input_mode == "file":
+                if not json_file or not json_file.strip():
+                    return ("", "", "", "", "", "Error: 請提供 JSON 檔案路徑")
+                
+                if not os.path.exists(json_file):
+                    return ("", "", "", "", "", f"Error: 檔案不存在: {json_file}")
+                
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        json_data = json.load(f)
+                except json.JSONDecodeError as e:
+                    return ("", "", "", "", "", f"Error: JSON 解析錯誤: {str(e)}")
+            else:
+                if not json_text or not json_text.strip():
+                    return ("", "", "", "", "", "Error: 請提供 JSON 文本")
+                
+                try:
+                    json_data = json.loads(json_text)
+                except json.JSONDecodeError as e:
+                    return ("", "", "", "", "", f"Error: JSON 解析錯誤: {str(e)}")
+
+            # 執行查詢
+            results = []
+            queries_info = []
+            
+            query_pairs = [
+                (key_1, field_1),
+                (key_2, field_2),
+                (key_3, field_3),
+                (key_4, field_4),
+                (key_5, field_5)
+            ]
+            
+            for i, (key, field) in enumerate(query_pairs, 1):
+                result = self._query_path(json_data, key, field)
+                results.append(result)
+                
+                # 記錄查詢信息
+                if key or field:
+                    query_path = self._build_query_path(key, field)
+                    if result:
+                        queries_info.append(f"Q{i}: {query_path} ✓")
+                    else:
+                        queries_info.append(f"Q{i}: {query_path} ✗")
+            
+            # 生成狀態信息
+            if queries_info:
+                status = " | ".join(queries_info)
+            else:
+                status = "No queries provided"
+            
+            return (results[0], results[1], results[2], results[3], results[4], status)
+
+        except Exception as e:
+            logger.error(f"Error in JsonQueryNode: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return ("", "", "", "", "", f"Error: {str(e)}")
+
+    def _query_path(self, data, key, field):
+        """
+        查詢指定路徑的資料
+        支援 key='a', field='b.c' 或 key='a.b.c' 或 field='a.b.c'
+        """
+        try:
+            # 如果 key 和 field 都為空，返回空
+            if not key and not field:
+                return ""
+            
+            # 建立完整路徑
+            full_path = self._build_query_path(key, field)
+            if not full_path:
+                return ""
+            
+            # 分割路徑並逐層查詢
+            path_parts = full_path.split('.')
+            current = data
+            
+            for part in path_parts:
+                if not part:  # 跳過空字串
+                    continue
+                
+                if isinstance(current, dict):
+                    if part in current:
+                        current = current[part]
+                    else:
+                        logger.warning(f"Key '{part}' not found in path '{full_path}'")
+                        return ""
+                elif isinstance(current, list):
+                    # 如果是列表，嘗試轉換索引
+                    try:
+                        index = int(part)
+                        if 0 <= index < len(current):
+                            current = current[index]
+                        else:
+                            logger.warning(f"Index {index} out of range in path '{full_path}'")
+                            return ""
+                    except ValueError:
+                        logger.warning(f"Invalid index '{part}' in path '{full_path}'")
+                        return ""
+                else:
+                    logger.warning(f"Cannot navigate further in path '{full_path}' at '{part}'")
+                    return ""
+            
+            # 轉換結果為字串
+            if isinstance(current, (dict, list)):
+                return json.dumps(current, ensure_ascii=False)
+            else:
+                return str(current)
+        
+        except Exception as e:
+            logger.error(f"Error querying path: {str(e)}")
+            return ""
+
+    def _build_query_path(self, key, field):
+        """建立完整的查詢路徑"""
+        parts = []
+        if key and key.strip():
+            parts.append(key.strip())
+        if field and field.strip():
+            parts.append(field.strip())
+        return '.'.join(parts)
+
 # 節點類映射
 NODE_CLASS_MAPPINGS = {
     "TextBatch": TextBatchNode, 
     "TextQueueProcessor": TextQueueProcessor,
     "TextSplitCounter": TextSplitCounterNode,
     "ImageQueueProcessor": ImageQueueProcessor,
+    "ImageQueueProcessorPro": ImageQueueProcessorPro,  # 新增：延遲載入的隊列處理器
     "ImageInfoExtractor": ImageInfoExtractorNode,
     "PathParser": PathParserNode,
     "LoadImagesFromDirBatch": LoadImagesFromDirBatchM,
     "ImageFilenameProcessor": ImageFilenameProcessor,
+    "LoadImageByIndex": LoadImageByIndex,  # 新增：根據索引延遲載入單張圖片
+    "LoadImagesFromDirLazy": LoadImagesFromDirLazy,  # 新增：延遲載入模式 - 先獲取檔案列表
     "ImageQueueProcessorPlus": ImageQueueProcessorPlus,
     "TextSplitGet": TextSplitGet,
     "IFMatchCond": IFMatchCond,
     "DataTmpSet": DataTmpSet,
     "DataTmpGet": DataTmpGet,
-    "TextArrayIndex": TextArrayIndex,  # 新增
-    "DataTempManager": DataTempManager  # 新增
+    "TextArrayIndex": TextArrayIndex,
+    "DataTempManager": DataTempManager,
+    "GroupController": GroupController,
+    "JsonQuery": JsonQueryNode,
+    "UniversalLoopController": UniversalLoopController,  # 新增萬用循環控制器
+    "LoopResultExtractor": LoopResultExtractor  # 新增循環結果提取器
 }
 
 # 節點顯示名稱映射
@@ -1843,15 +2770,22 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TextQueueProcessor": "Text Queue Processor",
     "TextSplitCounter": "Text Split Counter",
     "ImageQueueProcessor": "Image Queue Processor",
+    "ImageQueueProcessorPro": "Image Queue Processor Pro (延遲載入)",
     "ImageInfoExtractor": "Image Info Extractor",
     "PathParser": "Path Parser",
     "LoadImagesFromDirBatch": "Load Images From Dir Batch",
     "ImageFilenameProcessor": "Image Filename Processor",
+    "LoadImageByIndex": "Load Image By Index (延遲載入)",
+    "LoadImagesFromDirLazy": "Scan Images Dir (延遲模式)",
     "ImageQueueProcessorPlus": "Image Queue Processor Plus",
     "TextSplitGet": "Text Split Get",
     "IFMatchCond": "IF Match Condition",
     "DataTmpSet": "Data Temp Set",
     "DataTmpGet": "Data Temp Get",
-    "TextArrayIndex": "Text Array Index",  # 新增
-    "DataTempManager": "Data Temp Manager"  # 新增
+    "TextArrayIndex": "Text Array Index",
+    "DataTempManager": "Data Temp Manager",
+    "GroupController": "Group Controller",
+    "JsonQuery": "JSON Query",
+    "UniversalLoopController": "Universal Loop Controller",  # 萬用循環控制器
+    "LoopResultExtractor": "Loop Result Extractor"  # 循環結果提取器
 }

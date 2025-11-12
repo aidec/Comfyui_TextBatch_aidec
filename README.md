@@ -28,7 +28,11 @@ Text Queue Processor
 
 將text拉到想要的地方，例如：正向提示詞(Clip)
 
-
+### 新增功能Image Queue Processor Pro(批量圖生圖推薦使用)：
+增加了 Image Queue Processor Pro節點，此節點可以直接設定讀取的資料夾，將資料夾圖片檔名分組，指定index才讀取圖片。
+跟之前的Image Queue Processor不同，之前的Image Queue Processor是先將所有圖片讀取到記憶體，再依照index讀取圖片，這樣會大幅占用記憶體。新版的pro節點，只讀取資料夾檔案清單，並讀取對應index的圖片，不會占用記憶體。推薦使用這個節點來進行批量圖生圖。
+舊版本的大概只支援100~200張左右的圖片就會吃掉好幾GB的記憶體，新版的pro節點目錄中有200張圖大概只吃20MB左右的記憶體。
+ 
 
 ### 新增功能Image Queue Processor(批量圖生圖)：
 增加了 Image Queue Processor 節點，可以將圖片每行一組，批量執行(但目前需要搭配Load Image Batch From D(Inspire)這類的使用)
